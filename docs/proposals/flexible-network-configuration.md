@@ -168,7 +168,7 @@ introduced by this proposal.
 |---|---|---|---|
 | 1 | GCP IAM Service Account | created (`<technicalID>`) | unchanged — still created |
 | 2 | VPC network | created (`<technicalID>`) unless `Networks.VPC.Name` set | required BYO reference (`Networks.VPC.Name`) — verify-only |
-| 3 | Worker subnetwork (`PurposeNodes`) | created (`<technicalID>-nodes`) | required BYO reference (`Networks.SubnetNodes.Name`) — verify-only |
+| 3 | Worker subnetwork (`PurposeNodes`) | created (`<technicalID>-nodes`) | required BYO reference (`Networks.SubnetWorkers.Name`) — verify-only |
 | 4 | Internal subnetwork (`PurposeInternal`) | created (`<technicalID>-internal`) if `Networks.Internal` set | forbidden; internal LB IPs allocate from the workers subnet via `subnetwork-name` fallback in `cloudprovider.conf` |
 | 5 | Services subnetwork (`PurposeServices`) | created (`<technicalID>-services`), dual-stack only | dual-stack: required BYO reference (`Networks.SubnetServices.Name`) — verify-only. IPv4: N/A |
 | 6 | Cloud Router | created (`<technicalID>-cloud-router`) unless `Networks.VPC.CloudRouter.Name` set | forbidden; user manages any router out-of-band |
@@ -179,7 +179,7 @@ introduced by this proposal.
 | 11 | Firewall rule `<technicalID>-allow-internal-access-ipv6` | created, untargeted, dual-stack only | dual-stack: not created; user pre-provisions equivalent |
 | 12 | Firewall rule `<technicalID>-allow-health-checks-ipv6` | created, untargeted, dual-stack only | dual-stack: not created; user pre-provisions equivalent |
 | 13 | IPv6 CIDR assignment on subnets | waited-for during reconcile, dual-stack only | N/A — user's subnets bring their own IPv6 CIDRs already |
-| 14 | Alias-IP ranges on worker VMs (instance-scoped, dual-stack) | written per-VM by MCM using the workers subnet's secondary range `ipv4-pod-cidr` | dual-stack: written per-VM by MCM using the workers subnet's secondary range named by `SubnetNodes.PodSecondaryRangeName` |
+| 14 | Alias-IP ranges on worker VMs (instance-scoped, dual-stack) | written per-VM by MCM using the workers subnet's secondary range `ipv4-pod-cidr` | dual-stack: written per-VM by MCM using the workers subnet's secondary range named by `SubnetWorkers.PodSecondaryRangeName` |
 
 **Per-Bastion resources (bastion controller):**
 
@@ -218,51 +218,42 @@ Two new optional fields on `NetworkConfig`
 type NetworkConfig struct {
     // ... existing fields (VPC, CloudNAT, Internal, Worker, Workers, FlowLogs, MTU) ...
 
-    // SubnetNodes is an optional reference to an already-existing worker subnetwork
-    // inside the user-provided VPC. When set, the infrastructure reconciler creates
-    // no network-layer resources in the user's VPC: it does not create or manage the
-    // worker subnetwork, the services subnetwork, the Cloud Router, Cloud NAT, or
-    // the static firewall rules. Firewall rules created at runtime by the
-    // cloud-controller-manager for Service type=LoadBalancer and by ingress-gce for
-    // dual-stack shoots are tag-scoped to worker VMs and continue to be
-    // created/deleted normally.
+    // SubnetWorkers is a reference to a user-managed subnet for worker nodes.
+    // When set, the extension operates in BYO (bring-your-own) subnet mode:
+    // Gardener does not create or delete the subnet; it only attaches to it.
+    // Firewall rules created at runtime by the cloud-controller-manager for
+    // Service type=LoadBalancer and by ingress-gce for dual-stack shoots are
+    // tag-scoped to worker VMs and continue to be created/deleted normally.
     //
-    // Requires Networks.VPC.Name to be set. Forbids Networks.VPC.CloudRouter,
-    // Networks.Workers, Networks.Internal, Networks.CloudNAT, Networks.FlowLogs,
-    // and Networks.MTU.
+    // VPC.Name must be set; CloudNAT, Internal, Worker/Workers, FlowLogs, and
+    // MTU must not be set.
     // +optional
-    SubnetNodes *SubnetReference `json:"subnetNodes,omitempty"`
+    SubnetWorkers *SubnetReference `json:"subnetWorkers,omitempty"`
 
-    // SubnetServices is an optional reference to an already-existing subnetwork
-    // used to allocate the IPv6 services CIDR (see the dual-stack specifics
-    // section for details). Required together with SubnetNodes for dual-stack
-    // shoots. Forbidden for single-stack IPv4 shoots and forbidden without
-    // SubnetNodes.
+    // SubnetServices is a reference to a user-managed subnet for services
+    // (required for dual-stack BYO shoots). Only valid when SubnetWorkers is set.
     // +optional
     SubnetServices *SubnetReference `json:"subnetServices,omitempty"`
 }
 
-// SubnetReference references an existing subnetwork in an existing VPC.
+// SubnetReference is a reference to a user-managed GCP subnetwork.
 type SubnetReference struct {
     // Name is the name of the subnetwork.
     Name string `json:"name"`
 
-    // PodSecondaryRangeName is the name of the secondary IP range on the
-    // referenced subnetwork carrying the IPv4 pod CIDR (used with alias-IP
-    // pod IPAM). Required on SubnetNodes for dual-stack shoots. Ignored
-    // (and rejected by validation) on SubnetNodes for single-stack IPv4
-    // shoots and on SubnetServices in all cases.
+    // PodSecondaryRangeName is the name of the secondary IP range on the nodes
+    // subnet that is used for pod IPs (required for dual-stack BYO shoots).
     // +optional
     PodSecondaryRangeName *string `json:"podSecondaryRangeName,omitempty"`
 }
 ```
 
-No new status enum. Mode is inferred from `SubnetNodes` presence (see
+No new status enum. Mode is inferred from `SubnetWorkers` presence (see
 [Derived mode](#derived-mode)).
 
 **Summary of subnets and ranges the extension references** (BYO mode):
 
-| Shoot networking | Worker subnetwork (`SubnetNodes`) | Services subnetwork (`SubnetServices`) |
+| Shoot networking | Worker subnetwork (`SubnetWorkers`) | Services subnetwork (`SubnetServices`) |
 |---|---|---|
 | Single-stack IPv4 | Primary IPv4 range only. No secondary range. | Not used. |
 | Dual-stack | Primary IPv4 range + secondary IPv4 range for pods (`PodSecondaryRangeName`) + external IPv6 `/64`. | External IPv6 `/64`. No secondary range. |
@@ -276,11 +267,11 @@ used for.
 // IsUserManagedEgress reports whether the shoot opts into BYO subnetworks and
 // user-managed egress by bringing an existing worker subnetwork.
 func (c *InfrastructureConfig) IsUserManagedEgress() bool {
-    return c != nil && c.Networks.SubnetNodes != nil
+    return i != nil && i.Networks.SubnetWorkers != nil
 }
 ```
 
-The mode is signaled solely by `Networks.SubnetNodes`. No enum, no explicit
+The mode is signaled solely by `Networks.SubnetWorkers`. No enum, no explicit
 switch. Used in validation, reconciler task-gating, cloud-provider config
 emission, and deletion.
 
@@ -288,7 +279,7 @@ emission, and deletion.
 
 Added in `pkg/apis/gcp/validation/infrastructure.go`.
 
-**API-level, when `Networks.SubnetNodes != nil`:**
+**API-level, when `Networks.SubnetWorkers != nil`:**
 
 | Rule | Reason |
 |---|---|
@@ -299,12 +290,12 @@ Added in `pkg/apis/gcp/validation/infrastructure.go`.
 | `Networks.CloudNAT` forbidden | User manages egress out-of-band. |
 | `Networks.FlowLogs` forbidden | Flow logs are configured on the BYO subnet by the user. |
 | `Networks.MTU` forbidden | MTU is a property of the BYO subnet. |
-| `Networks.SubnetNodes.Name` non-empty, valid GCP subnet name | Standard field validation. |
-| `Networks.SubnetNodes.PodSecondaryRangeName` forbidden for single-stack IPv4 | Not used (custom routes). |
-| `Networks.SubnetNodes.PodSecondaryRangeName` required for dual-stack | Alias-IP pod IPAM depends on it. |
+| `Networks.SubnetWorkers.Name` non-empty, valid GCP subnet name | Standard field validation. |
+| `Networks.SubnetWorkers.PodSecondaryRangeName` forbidden for single-stack IPv4 | Not used (custom routes). |
+| `Networks.SubnetWorkers.PodSecondaryRangeName` required for dual-stack | Alias-IP pod IPAM depends on it. |
 | `Networks.SubnetServices` required for dual-stack | IPv6 services CIDR is sliced from this subnet's IPv6 range. |
 | `Networks.SubnetServices` forbidden for single-stack IPv4 | Only used for IPv6 services. |
-| `Networks.SubnetServices` forbidden without `Networks.SubnetNodes` | The two are a matched pair. |
+| `Networks.SubnetServices` forbidden without `Networks.SubnetWorkers` | The two are a matched pair. |
 
 **Runtime (pre-flight, `pkg/controller/infrastructure/configvalidator.go`):**
 
@@ -319,8 +310,8 @@ Added in `pkg/apis/gcp/validation/infrastructure.go`.
 
 **Immutability** (`ValidateInfrastructureConfigUpdate`):
 
-- `Networks.SubnetNodes` cannot be added or removed after shoot creation.
-- `Networks.SubnetNodes.Name`, `Networks.SubnetNodes.PodSecondaryRangeName`,
+- `Networks.SubnetWorkers` cannot be added or removed after shoot creation.
+- `Networks.SubnetWorkers.Name`, `Networks.SubnetWorkers.PodSecondaryRangeName`,
   and `Networks.SubnetServices.Name` are immutable once set.
 - Existing VPC and CloudRouter immutability rules continue to apply.
 
@@ -436,7 +427,7 @@ Single-stack IPv4:
 gcloud compute firewall-rules create <name>-allow-internal \
   --project=<project> --network=<vpc> \
   --direction=INGRESS --priority=1000 \
-  --source-ranges=<shoot.pods>,<shoot.nodes> \
+  --source-ranges=<shoot.nodes> \
   --target-tags=<technicalID> \
   --rules=icmp,ipip,tcp:1-65535,udp:1-65535
 
@@ -537,7 +528,7 @@ mirror `removeBYOResourceLabels` in the delete graph.
   CCM route controller (`--configure-cloud-routes=true`, one route per node,
   named `shoot--*`, next-hop instance = the node VM).
 - No alias-IP secondary range is required on the BYO subnet.
-  `Networks.SubnetNodes.PodSecondaryRangeName` and `Networks.SubnetServices`
+  `Networks.SubnetWorkers.PodSecondaryRangeName` and `Networks.SubnetServices`
   are both forbidden by validation.
 - On shoot delete, `ensureKubernetesRoutesDeleted` removes all `shoot--*`
   routes from the BYO VPC.
@@ -554,7 +545,7 @@ the BYO VPC (workers + services), with specific ranges configured on each.
 
 | Subnetwork | Referenced by | Ranges required on the subnet |
 |---|---|---|
-| Worker subnetwork | `Networks.SubnetNodes.Name` | Primary IPv4 range (a subset of `shoot.spec.networking.nodes`), plus a secondary IPv4 range named by `Networks.SubnetNodes.PodSecondaryRangeName` with `ipCidrRange` equal to `shoot.spec.networking.pods`, plus an external IPv6 CIDR (`stackType: IPV4_IPV6`, `ipv6AccessType: EXTERNAL`; GCP assigns a `/64` when the subnet is created). |
+| Worker subnetwork | `Networks.SubnetWorkers.Name` | Primary IPv4 range (a subset of `shoot.spec.networking.nodes`), plus a secondary IPv4 range named by `Networks.SubnetWorkers.PodSecondaryRangeName` with `ipCidrRange` equal to `shoot.spec.networking.pods`, plus an external IPv6 CIDR (`stackType: IPV4_IPV6`, `ipv6AccessType: EXTERNAL`; GCP assigns a `/64` when the subnet is created). |
 | Services subnetwork | `Networks.SubnetServices.Name` | An external IPv6 CIDR (`stackType: IPV4_IPV6`, `ipv6AccessType: EXTERNAL`). No secondary range. Primary IPv4 range must exist (GCP requires one on every subnet) but is unused by Gardener. |
 
 **How each range is used at runtime:**
@@ -623,7 +614,7 @@ kind: InfrastructureConfig
 networks:
   vpc:
     name: my-vpc
-  subnetNodes:
+  subnetWorkers:
     name: my-workers
 ```
 
@@ -649,7 +640,7 @@ kind: InfrastructureConfig
 networks:
   vpc:
     name: my-vpc
-  subnetNodes:
+  subnetWorkers:
     name: my-workers
     podSecondaryRangeName: my-pods
   subnetServices:
@@ -675,11 +666,11 @@ User pre-provisions:
 
 ## Migration and immutability
 
-- Existing managed shoots continue to work with no changes. `Networks.SubnetNodes`
+- Existing managed shoots continue to work with no changes. `Networks.SubnetWorkers`
   and `Networks.SubnetServices` are optional and additive.
 - New shoots may opt into BYO mode at creation time.
 - In-place transition between managed and BYO mode is forbidden. Once
-  created with `SubnetNodes` set, the shoot stays in BYO mode; once created
+  created with `SubnetWorkers` set, the shoot stays in BYO mode; once created
   without, it stays managed. Enforced in `ValidateInfrastructureConfigUpdate`.
   Rationale: transitioning would recreate/delete the worker subnet, Cloud
   Router, Cloud NAT, and firewall rules while workloads are running —
@@ -698,7 +689,7 @@ Before creating a BYO shoot the user MUST provide:
      external `/64` IPv6 CIDR at subnet creation.
    - A secondary IPv4 range with `ipCidrRange` **exactly equal** to
      `shoot.spec.networking.pods`. The name is arbitrary and passed into
-     `Networks.SubnetNodes.PodSecondaryRangeName`.
+     `Networks.SubnetWorkers.PodSecondaryRangeName`.
 4. (Dual-stack only) A separate services subnetwork in the same VPC and
    region, with `stackType: IPV4_IPV6` and `ipv6AccessType: EXTERNAL`.
    A primary IPv4 range is required by GCP (any small non-overlapping range
@@ -782,18 +773,18 @@ Implementation must pass the following scenarios end-to-end.
 
 | ID | Configuration | Pass criteria |
 |---|---|---|
-| C1 | `SubnetNodes` set, `VPC.Name` unset | API validation rejects. |
-| C2 | `SubnetNodes` set + `VPC.CloudRouter` set | Rejected. |
-| C3 | `SubnetNodes` set + `Networks.Workers` non-empty | Rejected. |
-| C4 | `SubnetNodes` set + `Networks.Internal` set | Rejected. |
-| C5 | `SubnetNodes` set + `Networks.CloudNAT` set | Rejected. |
-| C6 | `SubnetNodes` set + `Networks.FlowLogs` set | Rejected. |
-| C7 | `SubnetNodes` set + `Networks.MTU` set | Rejected. |
-| C8 | IPv4 shoot + `SubnetNodes.PodSecondaryRangeName` set | Rejected. |
-| C9 | Dual-stack shoot + `SubnetNodes.PodSecondaryRangeName` unset | Rejected. |
+| C1 | `SubnetWorkers` set, `VPC.Name` unset | API validation rejects. |
+| C2 | `SubnetWorkers` set + `VPC.CloudRouter` set | Rejected. |
+| C3 | `SubnetWorkers` set + `Networks.Workers` non-empty | Rejected. |
+| C4 | `SubnetWorkers` set + `Networks.Internal` set | Rejected. |
+| C5 | `SubnetWorkers` set + `Networks.CloudNAT` set | Rejected. |
+| C6 | `SubnetWorkers` set + `Networks.FlowLogs` set | Rejected. |
+| C7 | `SubnetWorkers` set + `Networks.MTU` set | Rejected. |
+| C8 | IPv4 shoot + `SubnetWorkers.PodSecondaryRangeName` set | Rejected. |
+| C9 | Dual-stack shoot + `SubnetWorkers.PodSecondaryRangeName` unset | Rejected. |
 | C10 | Dual-stack shoot + `SubnetServices` unset | Rejected. |
 | C11 | IPv4 shoot + `SubnetServices` set | Rejected. |
-| C12 | `SubnetServices` set without `SubnetNodes` | Rejected. |
+| C12 | `SubnetServices` set without `SubnetWorkers` | Rejected. |
 | C13 | BYO subnet name refers to a subnet that does not exist | Runtime validator rejects. |
 | C14 | BYO subnet CIDR is not a subset of `shoot.spec.networking.nodes` | Runtime validator rejects. |
 | C15 | Dual-stack BYO subnet with `stackType: IPV4_ONLY` | Runtime validator rejects. |
@@ -804,10 +795,10 @@ Implementation must pass the following scenarios end-to-end.
 
 | ID | Change | Pass criteria |
 |---|---|---|
-| D1 | Managed shoot: attempt to add `SubnetNodes` | Rejected. |
-| D2 | BYO shoot: attempt to remove `SubnetNodes` | Rejected. |
-| D3 | BYO shoot: change `SubnetNodes.Name` | Rejected. |
-| D4 | Dual-stack BYO shoot: change `SubnetNodes.PodSecondaryRangeName` or `SubnetServices.Name` | Rejected. |
+| D1 | Managed shoot: attempt to add `SubnetWorkers` | Rejected. |
+| D2 | BYO shoot: attempt to remove `SubnetWorkers` | Rejected. |
+| D3 | BYO shoot: change `SubnetWorkers.Name` | Rejected. |
+| D4 | Dual-stack BYO shoot: change `SubnetWorkers.PodSecondaryRangeName` or `SubnetServices.Name` | Rejected. |
 
 ### Group E — Runtime invariants
 
@@ -878,7 +869,7 @@ workloads are running. Deferred as future work.
   is required for dual-stack BYO. Managed dual-stack works today without
   emitting it (`Node.Spec.PodCIDRs` carries the range). If BYO dual-stack
   works the same way, no emission is needed; if not, the value must be
-  plumbed through from `SubnetNodes.PodSecondaryRangeName`.
+  plumbed through from `SubnetWorkers.PodSecondaryRangeName`.
 
 ## Out of scope
 
